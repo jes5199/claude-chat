@@ -158,6 +158,41 @@ async def get_irc_messages(since: int = -1) -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+async def irc_status() -> str:
+    """Show status of all IRC sessions including nudge health.
+
+    Shows who's connected, unread message counts, and whether nudges
+    are being delivered successfully.
+    """
+    result = await relay_command({"cmd": "status"})
+
+    if not result.get("ok"):
+        return f"Failed to get status: {result.get('error', 'unknown error')}"
+
+    sessions = result.get("sessions", [])
+    if not sessions:
+        return "No sessions connected."
+
+    lines = []
+    for s in sessions:
+        status_parts = []
+        if not s["connected"]:
+            status_parts.append("DISCONNECTED")
+        if s["unread"] > 0:
+            status_parts.append(f"{s['unread']} unread")
+        if s["nudges_pending"] > 3:
+            status_parts.append(f"STUCK ({s['nudges_pending']} nudges unanswered)")
+        elif s["nudges_pending"] > 0:
+            status_parts.append(f"{s['nudges_pending']} nudges pending")
+
+        status = ", ".join(status_parts) if status_parts else "ok"
+        active = f"{s['last_active_ago']}s ago" if s['last_active_ago'] else "never"
+        lines.append(f"  {s['nick']} ({s['session_id']}): {status} [active {active}]")
+
+    return "IRC Sessions:\n" + "\n".join(lines)
+
+
 if __name__ == "__main__":
     print("claude-chat MCP server starting (stdio)...", file=sys.stderr)
     mcp.run(transport="stdio", show_banner=False)

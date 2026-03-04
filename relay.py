@@ -46,6 +46,10 @@ class Session:
         self.reactor = None
         self.connected = False
         self.channel_joined = False
+        self.nudge_count = 0
+        self.last_nudge_time = 0.0
+        self.last_get_time = 0.0
+        self.reconnect_delay = 5  # exponential backoff: 5, 10, 20, 40, ... max 300
 
     async def connect(self, loop: asyncio.AbstractEventLoop):
         """Open a dedicated IRC connection for this session."""
@@ -58,6 +62,7 @@ class Session:
             log.info("[%s] Connected, joining %s", session.nick, IRC_CHANNEL)
             connection.join(IRC_CHANNEL)
             session.connected = True
+            session.reconnect_delay = 5  # reset backoff on successful connect
 
         def on_join(connection, event):
             if event.source.nick == session.nick:
@@ -80,7 +85,14 @@ class Session:
             session.connected = False
             session.channel_joined = False
             if session.session_id != "_relay":
-                log.warning("[%s] Disconnected from IRC", session.nick)
+                if not session.is_session_alive():
+                    log.info("[%s] Session dead (no live watcher PID), removing", session.nick)
+                    session.state.remove_session(session.session_id)
+                    return
+                delay = session.reconnect_delay
+                log.warning("[%s] Disconnected from IRC, reconnecting in %ds...", session.nick, delay)
+                loop.call_later(delay, lambda: loop.create_task(session.connect(loop)))
+                session.reconnect_delay = min(session.reconnect_delay * 2, 300)
             else:
                 log.warning("[relay] Disconnected, reconnecting in 5s...")
                 loop.call_later(5, lambda: loop.create_task(session.connect(loop)))
@@ -103,6 +115,17 @@ class Session:
             self.conn.privmsg(IRC_CHANNEL, message)
             return True
         return False
+
+    def is_session_alive(self) -> bool:
+        """Check if the Claude Code session is still alive via injector lockfile PID."""
+        lockpath = os.path.join(INJECTOR_DIR, f"{self.session_id}.lock")
+        try:
+            with open(lockpath, "r") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)  # check if process exists
+            return True
+        except (FileNotFoundError, ValueError, ProcessLookupError, OSError):
+            return False
 
     def disconnect(self):
         if self.conn and self.connected:
@@ -137,6 +160,13 @@ class RelayState:
     def get_online_nicks(self) -> list[str]:
         return [s.nick for s in self.sessions.values() if s.session_id != "_relay"]
 
+    def remove_session(self, session_id: str):
+        session = self.sessions.get(session_id)
+        if session:
+            session.disconnect()
+            del self.sessions[session_id]
+        self.pending_nudge.discard(session_id)
+
 
 state = RelayState()
 
@@ -147,6 +177,11 @@ state = RelayState()
 def nudge_session(session_id: str):
     """Write a nudge to the session's injector watchfile if available."""
     if session_id in state.pending_nudge:
+        return
+
+    # Only nudge if there are actually unread messages for this session
+    session = state.sessions.get(session_id)
+    if session and not state.get_messages_since(session.last_read):
         return
 
     watchfile = os.path.join(INJECTOR_DIR, session_id)
@@ -161,6 +196,9 @@ def nudge_session(session_id: str):
                     "Use get_irc_messages tool to read them.\n"
                 )
             state.pending_nudge.add(session_id)
+            if session:
+                session.nudge_count += 1
+                session.last_nudge_time = time.time()
             log.info("Nudged session %s", session_id[:8])
     except OSError:
         pass
@@ -186,6 +224,22 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         elif cmd == "join":
             session_id = request["session_id"]
             nick = request["nick"]
+
+            # Validate session ID: must have a matching lockfile in injector dir
+            # (proves this is a real Claude Code session, not a random UUID)
+            if session_id not in state.sessions:
+                lockfile = os.path.join(INJECTOR_DIR, f"{session_id}.lock")
+                if not os.path.exists(lockfile):
+                    response = {
+                        "ok": False,
+                        "error": (
+                            f"Invalid session_id: no lockfile found at {lockfile}. "
+                            "Pass your real session_id from the stop hook output."
+                        ),
+                    }
+                    writer.write(json.dumps(response).encode() + b"\n")
+                    await writer.drain()
+                    return
 
             # If already joined, just update nick if needed
             if session_id in state.sessions:
@@ -243,6 +297,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 response = {"ok": False, "error": "not joined"}
             else:
                 session.last_active = time.time()
+                session.last_get_time = time.time()
+                session.nudge_count = 0  # reset on successful get
                 if since is None:
                     since = session.last_read
                 messages = state.get_messages_since(since)
@@ -254,6 +310,26 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     "messages": messages,
                     "next_index": state.next_index,
                 }
+
+        elif cmd == "status":
+            now = time.time()
+            sessions_info = []
+            for sid, s in state.sessions.items():
+                if sid == "_relay":
+                    continue
+                unread = len(state.get_messages_since(s.last_read))
+                sessions_info.append({
+                    "nick": s.nick,
+                    "session_id": sid[:8],
+                    "connected": s.connected,
+                    "channel_joined": s.channel_joined,
+                    "unread": unread,
+                    "nudges_pending": s.nudge_count,
+                    "last_active_ago": round(now - s.last_active),
+                    "last_get_ago": round(now - s.last_get_time) if s.last_get_time else None,
+                    "last_nudge_ago": round(now - s.last_nudge_time) if s.last_nudge_time else None,
+                })
+            response = {"ok": True, "sessions": sessions_info}
 
         writer.write(json.dumps(response).encode() + b"\n")
         await writer.drain()
@@ -286,19 +362,23 @@ async def start_socket_server():
 
 
 async def cleanup_loop():
-    """Periodically remove stale sessions (inactive for over 1 hour)."""
+    """Periodically remove stale or dead sessions."""
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(60)
         now = time.time()
         for session_id in list(state.sessions):
             if session_id == "_relay":
                 continue
             session = state.sessions[session_id]
+            # Fast path: check if Claude Code process is dead
+            if not session.is_session_alive():
+                log.info("Removing dead session %s (%s) — watcher PID gone", session_id[:8], session.nick)
+                state.remove_session(session_id)
+                continue
+            # Slow path: remove sessions inactive for over 1 hour
             if now - session.last_active > 3600:
-                log.info("Cleaning up stale session %s (%s)", session_id[:8], session.nick)
-                session.disconnect()
-                del state.sessions[session_id]
-                state.pending_nudge.discard(session_id)
+                log.info("Removing stale session %s (%s) — inactive >1hr", session_id[:8], session.nick)
+                state.remove_session(session_id)
 
 
 # --- Auto-invite ---
@@ -343,8 +423,8 @@ async def invite_loop():
                         with open(invite_file, "w") as f:
                             f.write(
                                 f"IRC channel #loom is available. "
-                                f"Call join_irc(session_id=\\\"{session_id}\\\") "
-                                f"to join the chat."
+                                f"Your session_id is {session_id} -- "
+                                f"call join_irc with that session_id to join."
                             )
                         invited.add(session_id)
                         log.info("Invited session %s to join IRC", session_id[:8])
