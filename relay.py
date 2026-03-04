@@ -110,11 +110,35 @@ class Session:
         log.info("[%s] Connecting to %s:%d...", self.nick, IRC_SERVER, IRC_PORT)
         await self.conn.connect(IRC_SERVER, IRC_PORT, self.nick)
 
-    def send(self, message: str):
-        if self.conn and self.connected:
+    def send(self, message: str) -> dict:
+        """Send a message to IRC. Returns {"sent": True/False, "chunks": N}."""
+        if not (self.conn and self.connected):
+            return {"sent": False, "error": "not connected to IRC"}
+        # IRC max line is 512 bytes including protocol overhead.
+        # PRIVMSG #channel :msg\r\n plus nick!user@host prefix ≈ 100 bytes overhead.
+        # Chunk at 400 bytes to be safe.
+        max_chunk = 400
+        encoded = message.encode("utf-8")
+        if len(encoded) <= max_chunk:
             self.conn.privmsg(IRC_CHANNEL, message)
-            return True
-        return False
+            return {"sent": True, "chunks": 1}
+        # Split on whitespace boundaries
+        chunks_sent = 0
+        words = message.split(" ")
+        chunk = ""
+        for word in words:
+            test = (chunk + " " + word).strip()
+            if len(test.encode("utf-8")) > max_chunk:
+                if chunk:
+                    self.conn.privmsg(IRC_CHANNEL, chunk)
+                    chunks_sent += 1
+                chunk = word
+            else:
+                chunk = test
+        if chunk:
+            self.conn.privmsg(IRC_CHANNEL, chunk)
+            chunks_sent += 1
+        return {"sent": True, "chunks": chunks_sent}
 
     def is_session_alive(self) -> bool:
         """Check if the Claude Code session is still alive via injector lockfile PID."""
@@ -185,8 +209,18 @@ def nudge_session(session_id: str):
         return
 
     watchfile = os.path.join(INJECTOR_DIR, session_id)
+    lockfile = os.path.join(INJECTOR_DIR, f"{session_id}.lock")
+
+    # Watchfile may not exist if watcher cleaned up; check lockfile as proof of session
     if not os.path.exists(watchfile):
-        return
+        if os.path.exists(lockfile):
+            # Recreate watchfile so nudge can be delivered when watcher restarts
+            try:
+                open(watchfile, "a").close()
+            except OSError:
+                return
+        else:
+            return
 
     try:
         if os.path.getsize(watchfile) == 0:
@@ -281,13 +315,14 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 response = {"ok": False, "error": "not joined"}
             else:
                 session.last_active = time.time()
-                if session.send(message):
+                result = session.send(message)
+                if result["sent"]:
                     # Don't add to buffer here — the relay's on_pubmsg
                     # will pick it up from IRC to avoid duplicates
-                    response = {"ok": True, "nick": session.nick}
-                    log.info("[SEND] <%s> %s", session.nick, message)
+                    response = {"ok": True, "nick": session.nick, "chunks": result["chunks"]}
+                    log.info("[SEND] <%s> %s (%d chunk(s))", session.nick, message[:100], result["chunks"])
                 else:
-                    response = {"ok": False, "error": "not connected to IRC"}
+                    response = {"ok": False, "error": result.get("error", "not connected to IRC")}
 
         elif cmd == "get":
             session_id = request["session_id"]
@@ -370,12 +405,17 @@ async def cleanup_loop():
             if session_id == "_relay":
                 continue
             session = state.sessions[session_id]
-            # Fast path: check if Claude Code process is dead
+            # Grace period: don't reap sessions active via MCP in the last 5 minutes.
+            # The watcher is one-shot (exits after each nudge), so its PID goes stale
+            # between restarts — last_active from MCP calls is the real liveness signal.
+            if now - session.last_active < 300:
+                continue
+            # Check if Claude Code process is dead (watcher PID gone)
             if not session.is_session_alive():
-                log.info("Removing dead session %s (%s) — watcher PID gone", session_id[:8], session.nick)
+                log.info("Removing dead session %s (%s) — watcher PID gone and inactive >5min", session_id[:8], session.nick)
                 state.remove_session(session_id)
                 continue
-            # Slow path: remove sessions inactive for over 1 hour
+            # Remove sessions inactive for over 1 hour
             if now - session.last_active > 3600:
                 log.info("Removing stale session %s (%s) — inactive >1hr", session_id[:8], session.nick)
                 state.remove_session(session_id)
@@ -408,28 +448,25 @@ async def invite_loop():
                 # Skip if already joined or already invited
                 if session_id in state.sessions or session_id in invited:
                     continue
-                # Check if lock is actually held (active watcher)
+                # Check if watcher PID is alive (lockfile contains PID as text)
                 lockfile = os.path.join(INJECTOR_DIR, entry)
-                import fcntl
                 try:
-                    fd = os.open(lockfile, os.O_RDONLY)
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        # Got the lock — no watcher, skip
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                    except BlockingIOError:
-                        # Lock held — active session, invite it
-                        invite_file = os.path.join(INVITE_DIR, session_id)
-                        with open(invite_file, "w") as f:
-                            f.write(
-                                f"IRC channel #loom is available. "
-                                f"Your session_id is {session_id} -- "
-                                f"call join_irc with that session_id to join."
-                            )
-                        invited.add(session_id)
-                        log.info("Invited session %s to join IRC", session_id[:8])
-                    finally:
-                        os.close(fd)
+                    with open(lockfile, "r") as f:
+                        pid = int(f.read().strip())
+                    os.kill(pid, 0)  # check if process exists
+                except (FileNotFoundError, ValueError, ProcessLookupError, OSError):
+                    continue  # No watcher running, skip
+                # Active watcher found — invite session
+                invite_file = os.path.join(INVITE_DIR, session_id)
+                try:
+                    with open(invite_file, "w") as f:
+                        f.write(
+                            f"IRC channel #loom is available. "
+                            f"Your session_id is {session_id} -- "
+                            f"call join_irc with that session_id to join."
+                        )
+                    invited.add(session_id)
+                    log.info("Invited session %s to join IRC", session_id[:8])
                 except OSError:
                     pass
         except Exception as e:

@@ -125,6 +125,9 @@ async def send_irc_message(message: str) -> str:
     if not result.get("ok"):
         return f"Failed to send: {result.get('error', 'unknown error')}"
 
+    chunks = result.get("chunks", 1)
+    if chunks > 1:
+        return f"Sent as <{result['nick']}> (split into {chunks} messages due to IRC length limits): {message}"
     return f"Sent as <{result['nick']}>: {message}"
 
 
