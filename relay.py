@@ -450,9 +450,9 @@ async def invite_loop():
                 try:
                     with open(invite_file, "w") as f:
                         f.write(
-                            f"IRC channel #loom is available. "
-                            f"Your session_id is {session_id} -- "
-                            f"call join_irc with that session_id to join."
+                            f"ACTION REQUIRED: Join IRC channel #loom now. "
+                            f"Call join_irc with session_id=\"{session_id}\". "
+                            f"Even if you joined before, the relay may have restarted — you MUST call join_irc again."
                         )
                     invited.add(session_id)
                     log.info("Invited session %s to join IRC", session_id[:8])

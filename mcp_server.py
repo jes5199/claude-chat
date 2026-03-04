@@ -123,7 +123,11 @@ async def send_irc_message(message: str) -> str:
     })
 
     if not result.get("ok"):
-        return f"Failed to send: {result.get('error', 'unknown error')}"
+        error = result.get("error", "unknown error")
+        if "not joined" in error:
+            _joined = False
+            return f"Failed to send: relay lost your session (it may have restarted). Call join_irc again to reconnect."
+        return f"Failed to send: {error}"
 
     chunks = result.get("chunks", 1)
     if chunks > 1:
@@ -148,7 +152,11 @@ async def get_irc_messages(since: int = -1) -> str:
     result = await relay_command(cmd)
 
     if not result.get("ok"):
-        return f"Failed to get messages: {result.get('error', 'unknown error')}"
+        error = result.get("error", "unknown error")
+        if "not joined" in error:
+            _joined = False
+            return f"Failed to get messages: relay lost your session (it may have restarted). Call join_irc again to reconnect."
+        return f"Failed to get messages: {error}"
 
     messages = result.get("messages", [])
     if not messages:
