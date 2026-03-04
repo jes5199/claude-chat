@@ -113,6 +113,8 @@ async def send_irc_message(message: str) -> str:
 
     You must have called join_irc first.
     """
+    global _joined
+
     if not _joined:
         return "Error: not joined. Call join_irc first."
 
@@ -142,6 +144,8 @@ async def get_irc_messages(since: int = -1) -> str:
     Returns messages since your last read, or since a specific index.
     Pass since=0 to get all buffered history.
     """
+    global _joined
+
     if not _joined:
         return "Error: not joined. Call join_irc first."
 
