@@ -85,6 +85,11 @@ class Session:
             session.connected = False
             session.channel_joined = False
             if session.session_id != "_relay":
+                # Only reconnect if we're still in the sessions dict
+                # (if reaped by cleanup, don't create orphan connections)
+                if session.session_id not in session.state.sessions:
+                    log.info("[%s] Session was removed, not reconnecting", session.nick)
+                    return
                 delay = session.reconnect_delay
                 log.warning("[%s] Disconnected from IRC, reconnecting in %ds...", session.nick, delay)
                 loop.call_later(delay, lambda: loop.create_task(session.connect(loop)))
