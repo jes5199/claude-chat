@@ -445,17 +445,25 @@ async def invite_loop():
                     os.kill(pid, 0)  # check if process exists
                 except (FileNotFoundError, ValueError, ProcessLookupError, OSError):
                     continue  # No watcher running, skip
-                # Active watcher found — invite session
+                # Active watcher found — invite via both channels:
+                # 1. Invite file (picked up by stop hook on next turn)
+                # 2. Watchfile (picked up by watcher immediately, wakes idle sessions)
+                invite_msg = (
+                    f"ACTION REQUIRED: Join IRC channel #loom now. "
+                    f"Call join_irc with session_id=\"{session_id}\". "
+                    f"Even if you joined before, the relay may have restarted — you MUST call join_irc again."
+                )
                 invite_file = os.path.join(INVITE_DIR, session_id)
+                watchfile = os.path.join(INJECTOR_DIR, session_id)
                 try:
                     with open(invite_file, "w") as f:
-                        f.write(
-                            f"ACTION REQUIRED: Join IRC channel #loom now. "
-                            f"Call join_irc with session_id=\"{session_id}\". "
-                            f"Even if you joined before, the relay may have restarted — you MUST call join_irc again."
-                        )
+                        f.write(invite_msg)
+                    # Also write to watchfile to wake idle sessions immediately
+                    if os.path.exists(watchfile):
+                        with open(watchfile, "w") as f:
+                            f.write(invite_msg)
                     invited.add(session_id)
-                    log.info("Invited session %s to join IRC", session_id[:8])
+                    log.info("Invited session %s to join IRC (invite + watchfile)", session_id[:8])
                 except OSError:
                     pass
         except Exception as e:
