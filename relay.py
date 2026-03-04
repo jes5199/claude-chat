@@ -197,7 +197,11 @@ state = RelayState()
 def nudge_session(session_id: str):
     """Write a nudge to the session's injector watchfile if available."""
     if session_id in state.pending_nudge:
-        return
+        # Re-nudge if enough time has passed (watcher may have consumed the last nudge)
+        session = state.sessions.get(session_id)
+        if session and session.last_nudge_time and (time.time() - session.last_nudge_time < 30):
+            return  # Too soon, don't spam
+        state.pending_nudge.discard(session_id)
 
     # Only nudge if there are actually unread messages for this session
     session = state.sessions.get(session_id)
