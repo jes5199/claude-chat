@@ -1,0 +1,9 @@
+[project]
+name = "claude-chat"
+version = "0.1.0"
+description = "IRC relay for Claude Code sessions"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=2.10.5",
+    "irc>=20.0",
+]
