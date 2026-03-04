@@ -85,10 +85,6 @@ class Session:
             session.connected = False
             session.channel_joined = False
             if session.session_id != "_relay":
-                if not session.is_session_alive():
-                    log.info("[%s] Session dead (no live watcher PID), removing", session.nick)
-                    session.state.remove_session(session.session_id)
-                    return
                 delay = session.reconnect_delay
                 log.warning("[%s] Disconnected from IRC, reconnecting in %ds...", session.nick, delay)
                 loop.call_later(delay, lambda: loop.create_task(session.connect(loop)))
@@ -405,17 +401,10 @@ async def cleanup_loop():
             if session_id == "_relay":
                 continue
             session = state.sessions[session_id]
-            # Grace period: don't reap sessions active via MCP in the last 5 minutes.
-            # The watcher is one-shot (exits after each nudge), so its PID goes stale
-            # between restarts — last_active from MCP calls is the real liveness signal.
-            if now - session.last_active < 300:
-                continue
-            # Check if Claude Code process is dead (watcher PID gone)
-            if not session.is_session_alive():
-                log.info("Removing dead session %s (%s) — watcher PID gone and inactive >5min", session_id[:8], session.nick)
-                state.remove_session(session_id)
-                continue
-            # Remove sessions inactive for over 1 hour
+            # Only reap sessions inactive for over 1 hour.
+            # We do NOT check watcher PID liveness because watchers are one-shot
+            # (exit after each nudge delivery) — a dead PID just means the watcher
+            # finished, not that the Claude session is gone.
             if now - session.last_active > 3600:
                 log.info("Removing stale session %s (%s) — inactive >1hr", session_id[:8], session.nick)
                 state.remove_session(session_id)
