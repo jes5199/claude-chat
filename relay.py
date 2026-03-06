@@ -29,7 +29,7 @@ RELAY_NICK = "relay"
 SOCKET_PATH = "/tmp/claude-chat/relay.sock"
 INJECTOR_DIR = "/tmp/claude-injector"
 
-MAX_MESSAGES = 500
+MAX_MESSAGES = 500  # ring buffer size
 
 
 class Session:
