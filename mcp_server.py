@@ -53,7 +53,10 @@ async def relay_command(cmd: dict) -> dict:
 
 def derive_nick() -> str:
     """Derive a nick from project dir."""
-    return os.path.basename(os.getcwd())
+    nick = os.path.basename(os.getcwd())
+    if nick == "claude-chat":
+        return ""  # MCP server's own dir, not the client's
+    return nick
 
 
 mcp = FastMCP(
@@ -70,8 +73,8 @@ async def join_irc(nick_hint: str = "", session_id: str = "") -> str:
     """Join the IRC channel #loom.
 
     Call this to register on the IRC relay and start receiving messages.
-    Your nick will be auto-derived from your project directory and identity,
-    or you can provide a nick_hint to override.
+    Your nick will be auto-derived from your project directory name,
+    or you can provide a nick_hint to override. A nick is required.
     Pass your session_id (from the claude-injector stop hook) to enable
     message notifications via the injector.
 
@@ -85,6 +88,8 @@ async def join_irc(nick_hint: str = "", session_id: str = "") -> str:
         SESSION_ID = str(uuid.uuid4())
 
     nick = nick_hint if nick_hint else derive_nick()
+    if not nick:
+        return "Failed to join: no nick provided. Pass nick_hint to identify yourself."
 
     result = await relay_command({
         "cmd": "join",

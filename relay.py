@@ -76,9 +76,9 @@ class Session:
             if session.session_id == "_relay":
                 log.info("[IRC] <%s> %s", nick, message)
                 state.add_message(nick, message)
-                # Nudge all registered sessions
-                for sid in list(state.sessions):
-                    if sid != "_relay":
+                # Nudge all registered sessions except the sender
+                for sid, sess in list(state.sessions.items()):
+                    if sid != "_relay" and sess.nick != nick:
                         nudge_session(sid)
 
         def on_disconnect(connection, event):
