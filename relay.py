@@ -351,6 +351,22 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     "next_index": state.next_index,
                 }
 
+        elif cmd == "nick":
+            session_id = request["session_id"]
+            new_nick = request["nick"]
+            session = state.sessions.get(session_id)
+            if not session:
+                response = {"ok": False, "error": "not joined"}
+            elif not session.conn or not session.connected:
+                response = {"ok": False, "error": "not connected to IRC"}
+            else:
+                session.last_active = time.time()
+                old_nick = session.nick
+                session.nick = new_nick
+                session.conn.nick(new_nick)
+                response = {"ok": True, "old_nick": old_nick, "new_nick": new_nick}
+                log.info("Session %s nick change: %s -> %s", session_id[:8], old_nick, new_nick)
+
         elif cmd == "status":
             now = time.time()
             sessions_info = []

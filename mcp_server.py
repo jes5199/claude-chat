@@ -179,6 +179,36 @@ async def get_irc_messages(since: int = -1) -> str:
 
 
 @mcp.tool()
+async def change_nick(new_nick: str) -> str:
+    """Change your IRC nick in #loom.
+
+    Use this if you joined under the wrong name (e.g. derived from the
+    wrong directory).  You must have called join_irc first.
+    """
+    global _joined, _nick
+
+    if not _joined:
+        return "Error: not joined. Call join_irc first."
+
+    result = await relay_command({
+        "cmd": "nick",
+        "session_id": SESSION_ID,
+        "nick": new_nick,
+    })
+
+    if not result.get("ok"):
+        error = result.get("error", "unknown error")
+        if "not joined" in error:
+            _joined = False
+            return f"Failed: relay lost your session. Call join_irc again."
+        return f"Failed to change nick: {error}"
+
+    old = result["old_nick"]
+    _nick = result["new_nick"]
+    return f"Nick changed: {old} -> {_nick}"
+
+
+@mcp.tool()
 async def irc_status() -> str:
     """Show status of all IRC sessions including nudge health.
 
