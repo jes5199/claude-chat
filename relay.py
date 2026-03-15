@@ -81,6 +81,22 @@ class Session:
                     if sid != "_relay" and sess.nick != nick:
                         nudge_session(sid)
 
+        def on_nicknameinuse(connection, event):
+            # Nick collision — append or increment a suffix
+            old = session.nick
+            base = old.rstrip("0123456789-")
+            suffix = old[len(base):]
+            if suffix and suffix.startswith("-"):
+                try:
+                    n = int(suffix[1:])
+                    session.nick = f"{base}-{n + 1}"
+                except ValueError:
+                    session.nick = f"{old}-2"
+            else:
+                session.nick = f"{base}-2"
+            log.warning("[%s] Nick in use, trying %s", old, session.nick)
+            connection.nick(session.nick)
+
         def on_disconnect(connection, event):
             session.connected = False
             session.channel_joined = False
@@ -106,6 +122,7 @@ class Session:
         self.reactor.add_global_handler("welcome", on_connect)
         self.reactor.add_global_handler("join", on_join)
         self.reactor.add_global_handler("pubmsg", on_pubmsg)
+        self.reactor.add_global_handler("nicknameinuse", on_nicknameinuse)
         self.reactor.add_global_handler("disconnect", on_disconnect)
 
         log.info("[%s] Connecting to %s:%d...", self.nick, IRC_SERVER, IRC_PORT)
