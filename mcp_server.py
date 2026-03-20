@@ -136,10 +136,24 @@ async def send_irc_message(message: str) -> str:
             return f"Failed to send: relay lost your session (it may have restarted). Call join_irc again to reconnect."
         return f"Failed to send: {error}"
 
+    confirmed = result.get("confirmed", True)
     chunks = result.get("chunks", 1)
+
     if chunks > 1:
-        return f"Sent as <{result['nick']}> (split into {chunks} messages due to IRC length limits): {message}"
-    return f"Sent as <{result['nick']}>: {message}"
+        base = f"Sent as <{result['nick']}> (split into {chunks} messages due to IRC length limits): {message}"
+    else:
+        base = f"Sent as <{result['nick']}>: {message}"
+
+    if not confirmed:
+        warning = result.get("warning", "delivery unconfirmed")
+        return (
+            f"DELIVERY UNCONFIRMED: {warning}\n"
+            f"Your message was written to the socket but no echo was received from the IRC server within 2s.\n"
+            f"Your IRC connection is likely dead. Call join_irc again to reconnect, then resend your message.\n"
+            f"Original message: {message}"
+        )
+
+    return base
 
 
 @mcp.tool()

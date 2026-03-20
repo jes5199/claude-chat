@@ -128,18 +128,14 @@ class Session:
         log.info("[%s] Connecting to %s:%d...", self.nick, IRC_SERVER, IRC_PORT)
         await self.conn.connect(IRC_SERVER, IRC_PORT, self.nick)
 
-    def send(self, message: str) -> dict:
-        """Send a message to IRC. Returns {"sent": True/False, "chunks": N}."""
-        if not (self.conn and self.connected):
-            return {"sent": False, "error": "not connected to IRC"}
-        # IRC max line is 512 bytes including protocol overhead.
-        # PRIVMSG #channel :msg\r\n plus nick!user@host prefix ≈ 100 bytes overhead.
-        # Chunk at 400 bytes to be safe.
+    def _send_chunks(self, message: str) -> int:
+        """Send message to IRC, chunking if needed. Returns chunk count.
+        Raises on socket error."""
         max_chunk = 400
         encoded = message.encode("utf-8")
         if len(encoded) <= max_chunk:
             self.conn.privmsg(IRC_CHANNEL, message)
-            return {"sent": True, "chunks": 1}
+            return 1
         # Split on whitespace boundaries
         chunks_sent = 0
         words = message.split(" ")
@@ -156,7 +152,40 @@ class Session:
         if chunk:
             self.conn.privmsg(IRC_CHANNEL, chunk)
             chunks_sent += 1
-        return {"sent": True, "chunks": chunks_sent}
+        return chunks_sent
+
+    async def send(self, message: str) -> dict:
+        """Send a message to IRC and verify delivery via echo.
+
+        After writing to the socket, waits up to 2s for the message to
+        appear in the relay's buffer (echoed back by the IRC server).
+        If no echo arrives, warns that delivery is unconfirmed.
+        """
+        if not (self.conn and self.connected):
+            return {"sent": False, "error": "not connected to IRC"}
+
+        pre_index = self.state.next_index
+
+        try:
+            chunks_sent = self._send_chunks(message)
+        except Exception as e:
+            self.connected = False
+            self.channel_joined = False
+            return {"sent": False, "error": f"send failed (connection dead): {e}"}
+
+        # Wait for echo: the relay connection sees our message and buffers it
+        for _ in range(20):  # 2 seconds, checking every 0.1s
+            await asyncio.sleep(0.1)
+            recent = self.state.get_messages_since(pre_index)
+            if any(m["nick"] == self.nick for m in recent):
+                return {"sent": True, "chunks": chunks_sent, "confirmed": True}
+
+        return {
+            "sent": True,
+            "chunks": chunks_sent,
+            "confirmed": False,
+            "warning": "no echo received — message may not have been delivered, connection may be dead",
+        }
 
     def is_session_alive(self) -> bool:
         """Check if the Claude Code session is still alive via injector lockfile PID."""
@@ -337,12 +366,19 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 response = {"ok": False, "error": "not joined"}
             else:
                 session.last_active = time.time()
-                result = session.send(message)
+                result = await session.send(message)
                 if result["sent"]:
-                    # Don't add to buffer here — the relay's on_pubmsg
-                    # will pick it up from IRC to avoid duplicates
-                    response = {"ok": True, "nick": session.nick, "chunks": result["chunks"]}
-                    log.info("[SEND] <%s> %s (%d chunk(s))", session.nick, message[:100], result["chunks"])
+                    response = {
+                        "ok": True,
+                        "nick": session.nick,
+                        "chunks": result["chunks"],
+                        "confirmed": result.get("confirmed", False),
+                    }
+                    if not result.get("confirmed"):
+                        response["warning"] = result.get("warning", "delivery unconfirmed")
+                        log.warning("[SEND] <%s> UNCONFIRMED: %s", session.nick, message[:100])
+                    else:
+                        log.info("[SEND] <%s> %s (%d chunk(s))", session.nick, message[:100], result["chunks"])
                 else:
                     response = {"ok": False, "error": result.get("error", "not connected to IRC")}
 
