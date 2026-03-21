@@ -339,10 +339,21 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     await writer.drain()
                     return
 
-            # If already joined, just update nick if needed
+            # If already joined, update activity; reconnect if IRC connection is dead
             if session_id in state.sessions:
                 session = state.sessions[session_id]
                 session.last_active = time.time()
+                if nick and nick != session.nick:
+                    session.nick = nick
+                if not session.connected:
+                    try:
+                        await session.connect(loop)
+                        for _ in range(20):
+                            if session.channel_joined:
+                                break
+                            await asyncio.sleep(0.1)
+                    except Exception as e:
+                        log.warning("[%s] Reconnect on join failed: %s", session.nick, e)
             else:
                 # Create a new IRC connection for this session
                 session = Session(session_id, nick, state)
