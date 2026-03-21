@@ -53,6 +53,15 @@ class Session:
 
     async def connect(self, loop: asyncio.AbstractEventLoop):
         """Open a dedicated IRC connection for this session."""
+        # Clean up previous reactor to avoid orphan FD watchers and ghost connections
+        if self.reactor:
+            try:
+                self.reactor.disconnect_all("Reconnecting")
+            except Exception:
+                pass
+            self.reactor = None
+            self.conn = None
+
         self.reactor = irc.client_aio.AioReactor(loop=loop)
         self.conn = self.reactor.server()
         state = self.state
@@ -199,11 +208,15 @@ class Session:
             return False
 
     def disconnect(self):
-        if self.conn and self.connected:
+        if self.reactor:
             try:
-                self.conn.quit("Leaving")
+                self.reactor.disconnect_all("Leaving")
             except Exception:
                 pass
+            self.reactor = None
+            self.conn = None
+            self.connected = False
+            self.channel_joined = False
 
 
 class RelayState:
