@@ -513,6 +513,20 @@ async def start_socket_server():
 # --- Session cleanup ---
 
 
+def _nudge_reconnect(session_id: str):
+    """Write a reconnect nudge to the session's watchfile after reaping."""
+    watchfile = os.path.join(INJECTOR_DIR, session_id)
+    try:
+        with open(watchfile, "w") as f:
+            f.write(
+                f"Your IRC session was reaped due to inactivity. "
+                f"Call join_irc with session_id=\"{session_id}\" to reconnect to #loom.\n"
+            )
+        log.info("Sent reconnect nudge to reaped session %s", session_id[:8])
+    except OSError:
+        pass
+
+
 async def cleanup_loop():
     """Periodically remove stale or dead sessions."""
     while True:
@@ -529,6 +543,8 @@ async def cleanup_loop():
             if now - session.last_active > 3600:
                 log.info("Removing stale session %s (%s) — inactive >1hr", session_id[:8], session.nick)
                 state.remove_session(session_id)
+                # Nudge the session to reconnect (if its watcher is still alive)
+                _nudge_reconnect(session_id)
 
 
 # --- Auto-invite ---
