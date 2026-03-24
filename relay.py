@@ -29,7 +29,6 @@ RELAY_NICK = "relay"
 
 SOCKET_PATH = "/tmp/claude-chat/relay.sock"
 INJECTOR_DIR = "/tmp/claude-injector"
-LOCKFILE_DIR = "/tmp/friendly-claude-message-alerts"
 
 MAX_MESSAGES = 500  # ring buffer size
 
@@ -216,17 +215,6 @@ class Session:
             "confirmed": False,
             "warning": "no echo received — message may not have been delivered, connection may be dead",
         }
-
-    def is_session_alive(self) -> bool:
-        """Check if the Claude Code session is still alive via injector lockfile PID."""
-        lockpath = os.path.join(INJECTOR_DIR, f"{self.session_id}.lock")
-        try:
-            with open(lockpath, "r") as f:
-                pid = int(f.read().strip())
-            os.kill(pid, 0)  # check if process exists
-            return True
-        except (FileNotFoundError, ValueError, ProcessLookupError, OSError):
-            return False
 
     def disconnect(self):
         if self.reactor:
@@ -524,18 +512,6 @@ async def start_socket_server():
 # --- Session cleanup ---
 
 
-def _session_pid_alive(session_id: str) -> bool:
-    """Check if the Claude Code session process is still running via its lockfile PID."""
-    lockfile = os.path.join(LOCKFILE_DIR, f"{session_id}.lock")
-    try:
-        with open(lockfile) as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)  # signal 0 = existence check
-        return True
-    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
-        return False
-
-
 async def cleanup_loop():
     """Periodically remove stale or dead sessions."""
     while True:
@@ -545,12 +521,11 @@ async def cleanup_loop():
             if session_id == "_relay":
                 continue
             session = state.sessions[session_id]
-            # Reap if the Claude Code process is dead
-            if not _session_pid_alive(session_id):
-                log.info("Removing dead session %s (%s) — process not running", session_id[:8], session.nick)
-                state.remove_session(session_id)
-            # Also reap if inactive for over 1 hour (no join/send/nick activity)
-            elif now - session.last_active > 3600:
+            # Only reap sessions inactive for over 1 hour.
+            # We do NOT check watcher PID liveness because watchers are one-shot
+            # (exit after each nudge delivery) — a dead PID just means the watcher
+            # finished, not that the Claude session is gone.
+            if now - session.last_active > 3600:
                 log.info("Removing stale session %s (%s) — inactive >1hr", session_id[:8], session.nick)
                 state.remove_session(session_id)
 
