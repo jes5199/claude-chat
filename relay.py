@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 
 import irc.client_aio
@@ -28,6 +29,7 @@ RELAY_NICK = "relay"
 
 SOCKET_PATH = "/tmp/claude-chat/relay.sock"
 INJECTOR_DIR = "/tmp/claude-injector"
+LOCKFILE_DIR = "/tmp/friendly-claude-message-alerts"
 
 MAX_MESSAGES = 500  # ring buffer size
 
@@ -48,6 +50,8 @@ class Session:
         self.channel_joined = False
         self.nudge_count = 0
         self.last_nudge_time = 0.0
+        self._suppressing_disconnect = False
+        self._connect_time = time.time()  # default to creation time so uptime is never epoch-based
         self.last_get_time = 0.0
         self.reconnect_delay = 5  # exponential backoff: 5, 10, 20, 40, ... max 300
 
@@ -55,10 +59,12 @@ class Session:
         """Open a dedicated IRC connection for this session."""
         # Clean up previous reactor to avoid orphan FD watchers and ghost connections
         if self.reactor:
+            self._suppressing_disconnect = True
             try:
                 self.reactor.disconnect_all("Reconnecting")
             except Exception:
                 pass
+            self._suppressing_disconnect = False
             self.reactor = None
             self.conn = None
 
@@ -71,7 +77,7 @@ class Session:
             log.info("[%s] Connected, joining %s", session.nick, IRC_CHANNEL)
             connection.join(IRC_CHANNEL)
             session.connected = True
-            session.reconnect_delay = 5  # reset backoff on successful connect
+            session._connect_time = time.time()
 
         def on_join(connection, event):
             if event.source.nick == session.nick:
@@ -106,19 +112,33 @@ class Session:
             log.warning("[%s] Nick in use, trying %s", old, session.nick)
             connection.nick(session.nick)
 
+        def on_erroneous_nick(connection, event):
+            old = session.nick
+            session.nick = _sanitize_nick(old) or f"agent-{session.session_id[:6]}"
+            log.warning("[%s] Erroneous nick, trying %s", old, session.nick)
+            connection.nick(session.nick)
+
         def on_disconnect(connection, event):
             session.connected = False
             session.channel_joined = False
+            # Don't reconnect if this disconnect was triggered by connect() cleanup
+            if getattr(session, '_suppressing_disconnect', False):
+                return
             if session.session_id != "_relay":
                 # Only reconnect if we're still in the sessions dict
                 # (if reaped by cleanup, don't create orphan connections)
                 if session.session_id not in session.state.sessions:
                     log.info("[%s] Session was removed, not reconnecting", session.nick)
                     return
+                # Reset backoff if connection was stable (>30s), otherwise increase it
+                uptime = time.time() - getattr(session, '_connect_time', 0)
+                if uptime > 30:
+                    session.reconnect_delay = 5
                 delay = session.reconnect_delay
-                log.warning("[%s] Disconnected from IRC, reconnecting in %ds...", session.nick, delay)
-                loop.call_later(delay, lambda: loop.create_task(session.connect(loop)))
                 session.reconnect_delay = min(session.reconnect_delay * 2, 300)
+                log.warning("[%s] Disconnected from IRC (up %.0fs), reconnecting in %ds...",
+                            session.nick, uptime, delay)
+                loop.call_later(delay, lambda: loop.create_task(session.connect(loop)))
             else:
                 log.warning("[relay] Disconnected, reconnecting in 5s...")
                 loop.call_later(5, lambda: loop.create_task(session.connect(loop)))
@@ -132,6 +152,7 @@ class Session:
         self.reactor.add_global_handler("join", on_join)
         self.reactor.add_global_handler("pubmsg", on_pubmsg)
         self.reactor.add_global_handler("nicknameinuse", on_nicknameinuse)
+        self.reactor.add_global_handler("erroneusnickname", on_erroneous_nick)
         self.reactor.add_global_handler("disconnect", on_disconnect)
 
         log.info("[%s] Connecting to %s:%d...", self.nick, IRC_SERVER, IRC_PORT)
@@ -209,10 +230,12 @@ class Session:
 
     def disconnect(self):
         if self.reactor:
+            self._suppressing_disconnect = True
             try:
                 self.reactor.disconnect_all("Leaving")
             except Exception:
                 pass
+            self._suppressing_disconnect = False
             self.reactor = None
             self.conn = None
             self.connected = False
@@ -305,6 +328,14 @@ def nudge_session(session_id: str):
 # --- Unix Socket Server ---
 
 
+def _sanitize_nick(nick: str) -> str:
+    """Sanitize a nick for IRC: replace invalid chars with dashes, ensure valid format."""
+    nick = re.sub(r'[^a-zA-Z0-9_\-\[\]\\`^{}]', '-', nick)
+    # Nick must start with a letter or special char, not a digit or dash
+    nick = nick.lstrip('-0123456789')
+    return nick[:16] or "agent"
+
+
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
         data = await reader.readline()
@@ -321,7 +352,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
         elif cmd == "join":
             session_id = request["session_id"]
-            nick = request["nick"]
+            nick = _sanitize_nick(request["nick"])
 
             # Validate session ID: must have a matching lockfile in injector dir
             # (proves this is a real Claude Code session, not a random UUID)
@@ -413,7 +444,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             if not session:
                 response = {"ok": False, "error": "not joined"}
             else:
-                session.last_active = time.time()
                 session.last_get_time = time.time()
                 session.nudge_count = 0  # reset on successful get
                 if since is None:
@@ -494,6 +524,18 @@ async def start_socket_server():
 # --- Session cleanup ---
 
 
+def _session_pid_alive(session_id: str) -> bool:
+    """Check if the Claude Code session process is still running via its lockfile PID."""
+    lockfile = os.path.join(LOCKFILE_DIR, f"{session_id}.lock")
+    try:
+        with open(lockfile) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)  # signal 0 = existence check
+        return True
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
 async def cleanup_loop():
     """Periodically remove stale or dead sessions."""
     while True:
@@ -503,11 +545,12 @@ async def cleanup_loop():
             if session_id == "_relay":
                 continue
             session = state.sessions[session_id]
-            # Only reap sessions inactive for over 1 hour.
-            # We do NOT check watcher PID liveness because watchers are one-shot
-            # (exit after each nudge delivery) — a dead PID just means the watcher
-            # finished, not that the Claude session is gone.
-            if now - session.last_active > 3600:
+            # Reap if the Claude Code process is dead
+            if not _session_pid_alive(session_id):
+                log.info("Removing dead session %s (%s) — process not running", session_id[:8], session.nick)
+                state.remove_session(session_id)
+            # Also reap if inactive for over 1 hour (no join/send/nick activity)
+            elif now - session.last_active > 3600:
                 log.info("Removing stale session %s (%s) — inactive >1hr", session_id[:8], session.nick)
                 state.remove_session(session_id)
 
