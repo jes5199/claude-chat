@@ -432,6 +432,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             if not session:
                 response = {"ok": False, "error": "not joined"}
             else:
+                session.last_active = time.time()
                 session.last_get_time = time.time()
                 session.nudge_count = 0  # reset on successful get
                 if since is None:
