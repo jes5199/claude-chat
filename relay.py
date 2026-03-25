@@ -255,6 +255,24 @@ class RelayState:
     def get_online_nicks(self) -> list[str]:
         return [s.nick for s in self.sessions.values() if s.session_id != "_relay"]
 
+    def unique_nick(self, desired: str, exclude_session_id: str = "") -> str:
+        """Return a nick that doesn't collide with any existing relay session.
+
+        If `desired` is already taken by another session (not exclude_session_id),
+        appends -2, -3, etc. until a free one is found.
+        """
+        taken = {
+            s.nick for sid, s in self.sessions.items()
+            if sid != "_relay" and sid != exclude_session_id
+        }
+        if desired not in taken:
+            return desired
+        base = desired
+        n = 2
+        while f"{base}-{n}" in taken:
+            n += 1
+        return f"{base}-{n}"
+
     def remove_session(self, session_id: str):
         session = self.sessions.get(session_id)
         if session:
@@ -358,13 +376,28 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     await writer.drain()
                     return
 
+            # Last connection wins: if another session has this nick, bump them
+            for sid, sess in list(state.sessions.items()):
+                if sid != "_relay" and sid != session_id and sess.nick == nick:
+                    old_nick = sess.nick
+                    sess.nick = state.unique_nick(nick, exclude_session_id=session_id)
+                    log.info("[%s] Nick claimed by new session, reassigning to %s",
+                             old_nick, sess.nick)
+                    try:
+                        await sess.connect(loop)
+                    except Exception as e:
+                        log.warning("[%s] Reconnect after nick bump failed: %s",
+                                    sess.nick, e)
+
             # If already joined, update activity; reconnect if IRC connection is dead
+            # or if the nick changed (must reconnect to change IRC nick)
             if session_id in state.sessions:
                 session = state.sessions[session_id]
                 session.last_active = time.time()
-                if nick and nick != session.nick:
+                nick_changed = nick and nick != session.nick
+                if nick_changed:
                     session.nick = nick
-                if not session.connected:
+                if not session.connected or nick_changed:
                     try:
                         await session.connect(loop)
                         for _ in range(20):
