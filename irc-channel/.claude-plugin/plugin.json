@@ -1,0 +1,6 @@
+{
+  "name": "claude-chat",
+  "description": "Channel plugin for IRC relay (#loom) — pushes IRC messages as channel notifications",
+  "version": "0.0.1",
+  "keywords": ["channel", "irc", "messaging", "mcp"]
+}

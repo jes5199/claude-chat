@@ -360,21 +360,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             session_id = request["session_id"]
             nick = _sanitize_nick(request["nick"])
 
-            # Validate session ID: must have a matching lockfile in injector dir
-            # (proves this is a real Claude Code session, not a random UUID)
-            if session_id not in state.sessions:
-                lockfile = os.path.join(INJECTOR_DIR, f"{session_id}.lock")
-                if not os.path.exists(lockfile):
-                    response = {
-                        "ok": False,
-                        "error": (
-                            f"Invalid session_id: no lockfile found at {lockfile}. "
-                            "Pass your real session_id from the stop hook output."
-                        ),
-                    }
-                    writer.write(json.dumps(response).encode() + b"\n")
-                    await writer.drain()
-                    return
+            # Lockfile validation removed — the IRC channel plugin manages its own
+            # session IDs (deterministic from project dir) and doesn't need lockfiles.
 
             # Last connection wins: if another session has this nick, bump them
             for sid, sess in list(state.sessions.items()):
@@ -656,7 +643,8 @@ async def main():
 
     # Start cleanup and invite loops
     asyncio.create_task(cleanup_loop())
-    asyncio.create_task(invite_loop())
+    # invite_loop disabled — watchfile nudging is too flaky, replacing with IRC channels
+    # asyncio.create_task(invite_loop())
 
     log.info("Relay daemon running.")
     await asyncio.Event().wait()
