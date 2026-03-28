@@ -560,7 +560,7 @@ async def cleanup_loop():
             # We do NOT check watcher PID liveness because watchers are one-shot
             # (exit after each nudge delivery) — a dead PID just means the watcher
             # finished, not that the Claude session is gone.
-            if now - session.last_active > 3600:
+            if now - session.last_active > 10800:  # 3 hours
                 log.info("Removing stale session %s (%s) — inactive >1hr", session_id[:8], session.nick)
                 state.remove_session(session_id)
                 # Nudge the session to reconnect (if its watcher is still alive)
